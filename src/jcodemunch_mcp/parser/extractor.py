@@ -351,6 +351,13 @@ def _extract_name(node, spec: LanguageSpec, source_bytes: bytes) -> Optional[str
                     return source_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8")
         return None
 
+    # PowerShell: function_statement has function_name as a child node (not a named field)
+    if spec.ts_language == "powershell" and node.type == "function_statement":
+        for child in node.children:
+            if child.type == "function_name":
+                return source_bytes[child.start_byte:child.end_byte].decode("utf-8")
+        return None
+
     if node.type not in spec.name_fields:
         return None
     
@@ -558,6 +565,11 @@ def _count_error_nodes(node) -> int:
 
 def _extract_docstring(node, spec: LanguageSpec, source_bytes: bytes) -> str:
     """Extract docstring using language-specific strategy."""
+    if spec.ts_language == "powershell" and node.type == "function_statement":
+        docstring = _extract_powershell_docstring(node, source_bytes)
+        if docstring:
+            return docstring
+    
     if spec.docstring_strategy == "next_sibling_string":
         return _extract_python_docstring(node, source_bytes)
     elif spec.docstring_strategy == "preceding_comment":
@@ -620,11 +632,76 @@ def _extract_preceding_comments(node, source_bytes: bytes) -> str:
         comments.insert(0, comment_text)
         prev = prev.prev_named_sibling
     
+    # For languages like PowerShell where the node is wrapped in a container (e.g., statement_list),
+    # also check the parent's preceding siblings for comments
+    if not comments and node.parent:
+        prev = node.parent.prev_named_sibling
+        while prev and prev.type in ("annotation", "marker_annotation"):
+            prev = prev.prev_named_sibling
+        while prev and prev.type in ("comment", "line_comment", "block_comment", "documentation_comment", "pod"):
+            comment_text = source_bytes[prev.start_byte:prev.end_byte].decode("utf-8")
+            comments.insert(0, comment_text)
+            prev = prev.prev_named_sibling
+    
     if not comments:
         return ""
     
     docstring = "\n".join(comments)
     return _clean_comment_markers(docstring)
+
+
+def _extract_powershell_docstring(node, source_bytes: bytes) -> str:
+    """Extract PowerShell .DESCRIPTION or .SYNOPSIS from comment block inside function_statement.
+    
+    PowerShell documentation blocks appear as comment children of function_statement,
+    typically right after the opening brace. The format is:
+        <#
+        .DESCRIPTION
+        Description text
+        #>
+    """
+    # Look for comment nodes among direct children of function_statement
+    for child in node.children:
+        if child.type == "comment":
+            comment_text = source_bytes[child.start_byte:child.end_byte].decode("utf-8")
+            # Check if this looks like a PowerShell doc block
+            if "<#" in comment_text and "#>" in comment_text:
+                # Extract content between markers
+                lines = comment_text.split("\n")
+                doc_lines = []
+                capture = False
+                current_section = None
+                
+                for line in lines:
+                    stripped = line.strip()
+                    
+                    # Skip opening/closing markers
+                    if stripped == "<#" or stripped == "#>":
+                        continue
+                    
+                    # Look for section markers (.DESCRIPTION, .SYNOPSIS, etc.)
+                    if stripped.startswith("."):
+                        # Capture the section name
+                        parts = stripped.split(None, 1)
+                        current_section = parts[0]
+                        if current_section.upper() == ".DESCRIPTION":
+                            capture = True
+                        elif current_section.upper() == ".SYNOPSIS":
+                            capture = True
+                        else:
+                            capture = False
+                        continue
+                    
+                    # Capture content under DESCRIPTION or SYNOPSIS
+                    if (current_section and 
+                        current_section.upper() in (".DESCRIPTION", ".SYNOPSIS") and
+                        stripped and not stripped.startswith(".")):
+                        doc_lines.append(stripped)
+                
+                if doc_lines:
+                    return "\n".join(doc_lines)
+    
+    return ""
 
 
 def _clean_comment_markers(text: str) -> str:

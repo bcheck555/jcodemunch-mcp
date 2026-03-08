@@ -17,6 +17,8 @@
 | C++        | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.h`* | tree-sitter-cpp | function, class, method, type (struct/enum/union/alias), constant | — | `/* */` and `//` comments | Namespace symbols are used for qualification but not emitted as standalone symbols |
 | Elixir     | `.ex`, `.exs` | tree-sitter-elixir | class (defmodule/defimpl), type (defprotocol/@type/@callback), method (def/defp/defmacro/defguard inside module), function (top-level def) | — | `@doc`/`@moduledoc` strings | Homoiconic grammar; custom walker required. `defstruct`, `use`, `import`, `alias` not indexed |
 | Ruby       | `.rb`, `.rake` | tree-sitter-ruby  | class, type (module), method (instance + `self.` singleton), function (top-level def) | — | `#` preceding comments | `attr_accessor`, constants, and `include`/`extend` not indexed |
+| Bash       | `.sh`, `.bash` | tree-sitter-bash  | function                                          | —             | `#` comments               | `readonly` and `declare -r` constants captured                   |
+| PowerShell | `.ps1`, `.psm1`, `.psd1`, `.ps1xml` | tree-sitter-powershell | function | — | `<# #>` and `#` comments | `param()` blocks and `[Parameter()]` attributes in signature |
 
 \* `.h` uses C++ parsing first, then falls back to C when no C++ symbols are extracted.
 

@@ -1367,6 +1367,58 @@ def test_parse_bash():
     assert get_language_for_path("script.bash") == "bash"
 
 
+POWERSHELL_SOURCE = '''# Deploy the application
+function Deploy {
+    param(
+        [string]$Environment,
+        [string]$Version
+    )
+    Write-Output "Deploying to $Environment"
+}
+
+# Build and test
+function Build-Package {
+    <#
+    .DESCRIPTION
+    Build the package for distribution
+    #>
+    param(
+        [string]$Configuration = "Release"
+    )
+    dotnet build --configuration $Configuration
+}
+
+# Get version info
+function Get-Version {
+    return "1.0.0"
+}
+'''
+
+
+def test_parse_powershell():
+    """Test PowerShell parsing."""
+    symbols = parse_file(POWERSHELL_SOURCE, "build.ps1", "powershell")
+
+    deploy = next((s for s in symbols if s.name == "Deploy"), None)
+    assert deploy is not None
+    assert deploy.kind == "function"
+    assert "Deploy the application" in deploy.docstring
+
+    build_pkg = next((s for s in symbols if s.name == "Build-Package"), None)
+    assert build_pkg is not None
+    assert build_pkg.kind == "function"
+    assert "Build the package" in build_pkg.docstring
+
+    get_version = next((s for s in symbols if s.name == "Get-Version"), None)
+    assert get_version is not None
+    assert get_version.kind == "function"
+
+    from jcodemunch_mcp.parser.languages import get_language_for_path
+    assert get_language_for_path("build.ps1") == "powershell"
+    assert get_language_for_path("module.psm1") == "powershell"
+    assert get_language_for_path("manifest.psd1") == "powershell"
+
+
 def test_parse_nix():
     """Test Nix parsing."""
     symbols = parse_file(NIX_SOURCE, "default.nix", "nix")

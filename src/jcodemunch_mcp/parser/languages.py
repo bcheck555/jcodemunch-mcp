@@ -85,6 +85,10 @@ LANGUAGE_EXTENSIONS = {
     ".gleam": "gleam",
     ".sh": "bash",
     ".bash": "bash",
+    ".ps1": "powershell",
+    ".psm1": "powershell",
+    ".psd1": "powershell",
+    ".ps1xml": "powershell",
     ".nix": "nix",
     ".vue": "vue",
     ".ejs": "ejs",
@@ -714,6 +718,28 @@ BASH_SPEC = LanguageSpec(
 )
 
 
+# PowerShell specification
+# PowerShell supports function definitions with optional parameters and return types.
+# Functions can be defined with the 'function' keyword or simply by identifier.
+# Parameters use the `param()` block or [Parameter()] attributes.
+POWERSHELL_SPEC = LanguageSpec(
+    ts_language="powershell",
+    symbol_node_types={
+        "function_statement": "function",
+    },
+    name_fields={
+        "function_statement": "name",
+    },
+    param_fields={},
+    return_type_fields={},
+    docstring_strategy="preceding_comment",
+    decorator_node_type=None,
+    container_node_types=[],
+    constant_patterns=[],  # $null assignments not indexed
+    type_patterns=[],
+)
+
+
 # Nix specification
 # NOTE: Nix is an expression language; all constructs are `binding` nodes inside
 # binding_set children of let_expression or attrset_expression. Custom extraction
@@ -844,6 +870,7 @@ LANGUAGE_REGISTRY = {
     "kotlin": KOTLIN_SPEC,
     "gleam": GLEAM_SPEC,
     "bash": BASH_SPEC,
+    "powershell": POWERSHELL_SPEC,
     "nix": NIX_SPEC,
     "vue": VUE_SPEC,
     "ejs": EJS_SPEC,
