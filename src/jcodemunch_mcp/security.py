@@ -209,6 +209,13 @@ DEFAULT_MAX_FILE_SIZE = 500 * 1024  # 500KB
 DEFAULT_MAX_INDEX_FILES = 10_000
 MAX_INDEX_FILES_ENV_VAR = "JCODEMUNCH_MAX_INDEX_FILES"
 
+# Local folders are indexed synchronously inside an MCP tool call, so the
+# default cap is intentionally lower to stay within client timeouts.
+# Users can raise it via JCODEMUNCH_MAX_FOLDER_FILES (or the legacy
+# JCODEMUNCH_MAX_INDEX_FILES, which is honoured as a fallback).
+DEFAULT_MAX_FOLDER_FILES = 2_000
+MAX_FOLDER_FILES_ENV_VAR = "JCODEMUNCH_MAX_FOLDER_FILES"
+
 
 def get_max_index_files(max_files: Optional[int] = None) -> int:
     """Resolve the maximum indexed file count from arg or environment.
@@ -238,6 +245,40 @@ def get_max_index_files(max_files: Optional[int] = None) -> int:
         return DEFAULT_MAX_INDEX_FILES
 
     return parsed
+
+
+def get_max_folder_files(max_files: Optional[int] = None) -> int:
+    """Resolve the maximum indexed file count for local folder indexing.
+
+    Checks JCODEMUNCH_MAX_FOLDER_FILES first, then falls back to
+    JCODEMUNCH_MAX_INDEX_FILES for backward compatibility.  The default
+    (2,000) is intentionally lower than the GitHub repo default (10,000)
+    because local indexing runs synchronously inside an MCP tool call and
+    must complete within the client's timeout window.
+
+    Args:
+        max_files: Explicit override. Must be a positive integer when provided.
+
+    Returns:
+        Positive file-count limit.
+    """
+    if max_files is not None:
+        if max_files <= 0:
+            raise ValueError("max_files must be a positive integer")
+        return max_files
+
+    # Check folder-specific env var first, then legacy shared var.
+    for env_var in (MAX_FOLDER_FILES_ENV_VAR, MAX_INDEX_FILES_ENV_VAR):
+        value = os.environ.get(env_var)
+        if value is not None:
+            try:
+                parsed = int(value)
+            except ValueError:
+                continue
+            if parsed > 0:
+                return parsed
+
+    return DEFAULT_MAX_FOLDER_FILES
 
 
 def should_exclude_file(
@@ -306,4 +347,5 @@ SKIP_PATTERNS = [
     ".min.js", ".min.ts", ".bundle.js",
     "package-lock.json", "yarn.lock", "go.sum",
     "generated/", "proto/",
+    "*.xcodeproj/", "*.xcworkspace/", "DerivedData/", ".build/",
 ]

@@ -20,6 +20,9 @@ from jcodemunch_mcp.security import (
     DEFAULT_MAX_INDEX_FILES,
     MAX_INDEX_FILES_ENV_VAR,
     get_max_index_files,
+    DEFAULT_MAX_FOLDER_FILES,
+    MAX_FOLDER_FILES_ENV_VAR,
+    get_max_folder_files,
 )
 
 
@@ -241,6 +244,42 @@ class TestMaxIndexFilesConfig:
     def test_non_positive_explicit_value_is_rejected(self):
         with pytest.raises(ValueError, match="positive integer"):
             get_max_index_files(0)
+
+
+class TestMaxFolderFilesConfig:
+    def test_default_is_lower_than_repo_default(self):
+        assert DEFAULT_MAX_FOLDER_FILES < DEFAULT_MAX_INDEX_FILES
+
+    def test_defaults_when_env_is_unset(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert get_max_folder_files() == DEFAULT_MAX_FOLDER_FILES
+
+    def test_folder_specific_env_var_takes_priority(self):
+        env = {MAX_FOLDER_FILES_ENV_VAR: "500", MAX_INDEX_FILES_ENV_VAR: "9999"}
+        with patch.dict(os.environ, env, clear=True):
+            assert get_max_folder_files() == 500
+
+    def test_falls_back_to_legacy_env_var(self):
+        env = {MAX_INDEX_FILES_ENV_VAR: "1234"}
+        with patch.dict(os.environ, env, clear=True):
+            assert get_max_folder_files() == 1234
+
+    def test_invalid_folder_env_falls_back_to_legacy(self):
+        env = {MAX_FOLDER_FILES_ENV_VAR: "bad", MAX_INDEX_FILES_ENV_VAR: "999"}
+        with patch.dict(os.environ, env, clear=True):
+            assert get_max_folder_files() == 999
+
+    def test_both_invalid_returns_default(self):
+        env = {MAX_FOLDER_FILES_ENV_VAR: "bad", MAX_INDEX_FILES_ENV_VAR: "also_bad"}
+        with patch.dict(os.environ, env, clear=True):
+            assert get_max_folder_files() == DEFAULT_MAX_FOLDER_FILES
+
+    def test_explicit_override_respected(self):
+        assert get_max_folder_files(42) == 42
+
+    def test_non_positive_explicit_value_is_rejected(self):
+        with pytest.raises(ValueError, match="positive integer"):
+            get_max_folder_files(0)
 
 
 # --- Integration: discover_local_files with security ---

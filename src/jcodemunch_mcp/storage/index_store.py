@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Optional
 
 from ..parser.symbols import Symbol
+
+logger = logging.getLogger(__name__)
 
 # Bump this when the index schema changes in an incompatible way.
 INDEX_VERSION = 4
@@ -28,6 +31,7 @@ def _get_git_head(repo_path: Path) -> Optional[str]:
             ["git", "rev-parse", "HEAD"],
             cwd=str(repo_path),
             capture_output=True, text=True, timeout=5,
+            stdin=subprocess.DEVNULL,
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -337,6 +341,10 @@ class IndexStore:
 
         return index
 
+    def has_index(self, owner: str, name: str) -> bool:
+        """Return True if an index file exists on disk (regardless of version)."""
+        return self._index_path(owner, name).exists()
+
     def load_index(self, owner: str, name: str) -> Optional[CodeIndex]:
         """Load index from storage. Rejects incompatible versions."""
         index_path = self._index_path(owner, name)
@@ -350,6 +358,10 @@ class IndexStore:
         # Version check
         stored_version = data.get("index_version", 1)
         if stored_version > INDEX_VERSION:
+            logger.warning(
+                "load_index version_mismatch — stored v%d > current v%d for %s/%s; rejecting index",
+                stored_version, INDEX_VERSION, owner, name,
+            )
             return None  # Future version we can't read
 
         repo_id, stored_owner, stored_name = self._repo_metadata_from_data(data, owner, name)

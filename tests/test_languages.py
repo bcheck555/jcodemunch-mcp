@@ -1496,9 +1496,8 @@ def test_parse_vue_ts():
     """Test Vue SFC parsing with TypeScript script block (lang="ts")."""
     symbols = parse_file(VUE_TS_SOURCE, "User.vue", "vue")
 
-    iface = next((s for s in symbols if s.name == "User"), None)
+    iface = next((s for s in symbols if s.name == "User" and s.kind == "type"), None)
     assert iface is not None
-    assert iface.kind == "type"
     assert iface.language == "vue"
 
     fn = next((s for s in symbols if s.name == "getName"), None)
@@ -1657,3 +1656,329 @@ def test_parse_verse_utf8_byte_offsets():
     # Content at the byte range should start with the declaration
     chunk = source_bytes[cls.byte_offset:cls.byte_offset + 7]
     assert chunk == b"MyClass"
+
+
+ERLANG_SOURCE = '''
+-module(math_utils).
+-export([add/2, factorial/1]).
+
+-type number_pair() :: {integer(), integer()}.
+-record(point, {x = 0 :: integer(), y = 0 :: integer()}).
+-define(MAX_ITER, 1000).
+
+%% Adds two integers together.
+add(A, B) ->
+    A + B.
+
+%% Computes the factorial of N.
+factorial(0) -> 1;
+factorial(N) when N > 0 -> N * factorial(N - 1).
+
+-spec add(integer(), integer()) -> integer().
+'''
+
+
+def test_parse_erlang_functions():
+    """Functions are extracted with correct name, arity-qualified_name, and signature."""
+    symbols = parse_file(ERLANG_SOURCE, "math_utils.erl", "erlang")
+
+    add = next((s for s in symbols if s.name == "add"), None)
+    assert add is not None
+    assert add.kind == "function"
+    assert add.qualified_name == "add/2"
+    assert "add" in add.signature
+    assert add.language == "erlang"
+    assert "Adds two integers" in add.docstring
+
+
+def test_parse_erlang_multiclauses_merged():
+    """Multi-clause functions produce exactly one symbol spanning all clauses."""
+    symbols = parse_file(ERLANG_SOURCE, "math_utils.erl", "erlang")
+
+    fac_syms = [s for s in symbols if s.name == "factorial"]
+    assert len(fac_syms) == 1, "multi-clause function should produce exactly one symbol"
+    fac = fac_syms[0]
+    assert fac.kind == "function"
+    assert fac.qualified_name == "factorial/1"
+    # end_line must span past the first clause
+    assert fac.end_line > fac.line
+    assert "Computes the factorial" in fac.docstring
+
+
+def test_parse_erlang_type():
+    """type_alias declarations are extracted as 'type' symbols."""
+    symbols = parse_file(ERLANG_SOURCE, "math_utils.erl", "erlang")
+
+    typ = next((s for s in symbols if s.name == "number_pair"), None)
+    assert typ is not None
+    assert typ.kind == "type"
+    assert "number_pair" in typ.signature
+
+
+def test_parse_erlang_record():
+    """-record declarations are extracted as 'type' symbols."""
+    symbols = parse_file(ERLANG_SOURCE, "math_utils.erl", "erlang")
+
+    rec = next((s for s in symbols if s.name == "point"), None)
+    assert rec is not None
+    assert rec.kind == "type"
+    assert "record" in rec.signature.lower()
+
+
+def test_parse_erlang_define():
+    """-define macros are extracted as 'constant' symbols."""
+    symbols = parse_file(ERLANG_SOURCE, "math_utils.erl", "erlang")
+
+    macro = next((s for s in symbols if s.name == "MAX_ITER"), None)
+    assert macro is not None
+    assert macro.kind == "constant"
+
+
+def test_parse_erlang_byte_offsets():
+    """Byte offsets must be valid positions within the encoded source."""
+    source_bytes = ERLANG_SOURCE.encode("utf-8")
+    symbols = parse_file(ERLANG_SOURCE, "math_utils.erl", "erlang")
+
+    for sym in symbols:
+        assert sym.byte_offset >= 0
+        assert sym.byte_offset + sym.byte_length <= len(source_bytes)
+
+
+def test_erlang_extension_mapping():
+    """Both .erl and .hrl map to the 'erlang' language."""
+    from jcodemunch_mcp.parser.languages import get_language_for_path
+    assert get_language_for_path("math_utils.erl") == "erlang"
+    assert get_language_for_path("include/defs.hrl") == "erlang"
+
+
+FORTRAN_SOURCE = '''
+! Computes the sum of two integers.
+function add(a, b) result(res)
+  integer, intent(in) :: a, b
+  integer :: res
+  res = a + b
+end function add
+
+! Greets the user.
+subroutine greet(name)
+  character(len=*), intent(in) :: name
+  print *, "Hello, " // name
+end subroutine greet
+
+module math_utils
+  implicit none
+  integer, parameter :: MAX_SIZE = 100
+  type :: Point
+    real :: x
+    real :: y
+  end type Point
+contains
+  ! Multiplies two reals.
+  function multiply(a, b) result(res)
+    real, intent(in) :: a, b
+    real :: res
+    res = a * b
+  end function multiply
+end module math_utils
+'''
+
+
+def test_parse_fortran_function():
+    """Top-level functions are extracted with docstrings."""
+    symbols = parse_file(FORTRAN_SOURCE, "math.f90", "fortran")
+
+    add = next((s for s in symbols if s.name == "add"), None)
+    assert add is not None
+    assert add.kind == "function"
+    assert "add" in add.signature
+    assert add.parent is None
+    assert "Computes the sum" in add.docstring
+    assert add.language == "fortran"
+
+
+def test_parse_fortran_subroutine():
+    """Top-level subroutines are extracted as function-kind symbols."""
+    symbols = parse_file(FORTRAN_SOURCE, "math.f90", "fortran")
+
+    greet = next((s for s in symbols if s.name == "greet"), None)
+    assert greet is not None
+    assert greet.kind == "function"
+    assert "subroutine" in greet.signature
+    assert "Greets the user" in greet.docstring
+
+
+def test_parse_fortran_module():
+    """Modules are extracted as class-kind symbols."""
+    symbols = parse_file(FORTRAN_SOURCE, "math.f90", "fortran")
+
+    mod = next((s for s in symbols if s.name == "math_utils"), None)
+    assert mod is not None
+    assert mod.kind == "class"
+    assert "module" in mod.signature
+    assert mod.parent is None
+
+
+def test_parse_fortran_module_method():
+    """Procedures inside a module are extracted as methods with the module as parent."""
+    symbols = parse_file(FORTRAN_SOURCE, "math.f90", "fortran")
+
+    mul = next((s for s in symbols if s.name == "multiply"), None)
+    assert mul is not None
+    assert mul.kind == "method"
+    assert mul.parent == "math_utils"
+    assert mul.qualified_name == "math_utils::multiply"
+    assert "Multiplies two reals" in mul.docstring
+
+
+def test_parse_fortran_derived_type():
+    """Derived type definitions inside modules are extracted as type symbols."""
+    symbols = parse_file(FORTRAN_SOURCE, "math.f90", "fortran")
+
+    pt = next((s for s in symbols if s.name == "Point"), None)
+    assert pt is not None
+    assert pt.kind == "type"
+    assert pt.parent == "math_utils"
+    assert "Point" in pt.signature
+
+
+def test_parse_fortran_parameter_constant():
+    """Parameter constants inside modules are extracted as constant symbols."""
+    symbols = parse_file(FORTRAN_SOURCE, "math.f90", "fortran")
+
+    const = next((s for s in symbols if s.name == "MAX_SIZE"), None)
+    assert const is not None
+    assert const.kind == "constant"
+    assert const.parent == "math_utils"
+    assert const.qualified_name == "math_utils::MAX_SIZE"
+
+
+def test_parse_fortran_byte_offsets():
+    """Byte offsets must be valid positions within the encoded source."""
+    source_bytes = FORTRAN_SOURCE.encode("utf-8")
+    symbols = parse_file(FORTRAN_SOURCE, "math.f90", "fortran")
+
+    for sym in symbols:
+        assert sym.byte_offset >= 0
+        assert sym.byte_offset + sym.byte_length <= len(source_bytes)
+
+
+def test_fortran_extension_mapping():
+    """Common Fortran file extensions map to the 'fortran' language."""
+    from jcodemunch_mcp.parser.languages import get_language_for_path
+    for ext in (".f90", ".f95", ".f03", ".f08", ".f", ".for", ".fpp"):
+        assert get_language_for_path(f"code{ext}") == "fortran", ext
+
+
+# ---------------------------------------------------------------------------
+# Vue SFC
+# ---------------------------------------------------------------------------
+
+VUE_COMPOSITION_SOURCE = """\
+<script setup lang="ts">
+import { ref, computed } from 'vue'
+
+// Current count
+const count = ref(0)
+const doubled = computed(() => count.value * 2)
+const props = defineProps<{ title: string; max?: number }>()
+const emit = defineEmits(['update'])
+
+function increment() {
+  count.value++
+  emit('update', count.value)
+}
+
+function reset() {
+  count.value = 0
+}
+</script>
+<template><div>{{ count }}</div></template>
+"""
+
+VUE_OPTIONS_SOURCE = """\
+<script>
+export default {
+  props: { items: Array, loading: Boolean },
+  data() { return { selected: null } },
+  computed: {
+    count() { return this.items.length },
+    hasItems() { return this.count > 0 }
+  },
+  methods: {
+    select(item) { this.selected = item },
+    clear() { this.selected = null }
+  }
+}
+</script>
+<template><div/></template>
+"""
+
+
+def test_vue_composition_component_symbol():
+    """Component name extracted from filename as class symbol."""
+    syms = parse_file(VUE_COMPOSITION_SOURCE, "Counter.vue", "vue")
+    comp = [s for s in syms if s.kind == "class" and s.name == "Counter"]
+    assert len(comp) == 1
+    assert comp[0].line == 1
+
+
+def test_vue_composition_ref_captured():
+    """ref() declarations captured as constants."""
+    syms = parse_file(VUE_COMPOSITION_SOURCE, "Counter.vue", "vue")
+    names = [s.name for s in syms if s.kind == "constant"]
+    assert "count" in names
+    assert "doubled" in names
+
+
+def test_vue_composition_define_macros():
+    """defineProps and defineEmits captured as constants."""
+    syms = parse_file(VUE_COMPOSITION_SOURCE, "Counter.vue", "vue")
+    names = [s.name for s in syms if s.kind == "constant"]
+    assert "props" in names
+    assert "emit" in names
+
+
+def test_vue_composition_functions():
+    """Function declarations captured with correct line numbers."""
+    syms = parse_file(VUE_COMPOSITION_SOURCE, "Counter.vue", "vue")
+    funcs = {s.name: s for s in syms if s.kind == "function"}
+    assert "increment" in funcs
+    assert "reset" in funcs
+    assert funcs["increment"].line > 1
+
+
+def test_vue_composition_parent_relationship():
+    """All symbols have the component as parent."""
+    syms = parse_file(VUE_COMPOSITION_SOURCE, "Counter.vue", "vue")
+    comp = next(s for s in syms if s.kind == "class")
+    children = [s for s in syms if s.parent == comp.id]
+    assert len(children) >= 4
+
+
+def test_vue_options_methods():
+    """Options API methods extracted as method symbols."""
+    syms = parse_file(VUE_OPTIONS_SOURCE, "MyList.vue", "vue")
+    methods = {s.name for s in syms if s.kind == "method"}
+    assert "select" in methods
+    assert "clear" in methods
+
+
+def test_vue_options_computed():
+    """Options API computed properties extracted as method symbols."""
+    syms = parse_file(VUE_OPTIONS_SOURCE, "MyList.vue", "vue")
+    computed = {s.name for s in syms if s.kind == "method"}
+    assert "count" in computed
+    assert "hasItems" in computed
+
+
+def test_vue_options_props():
+    """Options API props captured as constant."""
+    syms = parse_file(VUE_OPTIONS_SOURCE, "MyList.vue", "vue")
+    props = [s for s in syms if s.name == "props" and s.kind == "constant"]
+    assert len(props) == 1
+
+
+def test_vue_extension_mapping():
+    """.vue extension maps to vue language."""
+    from jcodemunch_mcp.parser.languages import get_language_for_path
+    assert get_language_for_path("src/components/Counter.vue") == "vue"

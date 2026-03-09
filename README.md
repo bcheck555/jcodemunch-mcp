@@ -440,6 +440,9 @@ For **LM Studio**, ensure the Local Server is running (usually on port 1234):
 | `OPENAI_API_KEY`            | API key for local LLMs (default: `local-llm`) | No |
 | `OPENAI_MODEL`              | Model name for local LLMs (default: `qwen3-coder`) | No |
 | `OPENAI_TIMEOUT`            | Timeout in seconds for local requests (default: `60.0`) | No |
+| `OPENAI_BATCH_SIZE`         | Symbols per summarization request (default: `10`) | No |
+| `OPENAI_CONCURRENCY`        | Max parallel batch requests (default: `1`) | No |
+| `OPENAI_MAX_TOKENS`         | Max output tokens per batch response (default: `500`) | No |
 | `CODE_INDEX_PATH`           | Custom cache path         | No       |
 | `JCODEMUNCH_MAX_INDEX_FILES`| Maximum files to index per repo/folder (default: `10000`) | No |
 | `JCODEMUNCH_SHARE_SAVINGS`  | Set to `0` to disable anonymous community token savings reporting | No       |

@@ -1,6 +1,7 @@
 """Three-tier summarization: docstring > AI (Haiku or Gemini) > signature fallback."""
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
 
@@ -307,6 +308,9 @@ class OpenAIBatchSummarizer:
             # Strip trailing slash if present
             self.api_base = self.api_base.rstrip("/")
             self.model = os.environ.get("OPENAI_MODEL", self.model)
+            self.max_tokens_per_batch = int(
+                os.environ.get("OPENAI_MAX_TOKENS", str(self.max_tokens_per_batch))
+            )
             self._init_client()
 
     def _init_client(self):
@@ -334,14 +338,19 @@ class OpenAIBatchSummarizer:
                     sym.summary = signature_fallback(sym)
             return symbols
 
+        batch_size = int(os.environ.get("OPENAI_BATCH_SIZE", str(batch_size)))
         to_summarize = [s for s in symbols if not s.summary and not s.docstring]
 
         if not to_summarize:
             return symbols
 
-        for i in range(0, len(to_summarize), batch_size):
-            batch = to_summarize[i:i + batch_size]
-            self._summarize_one_batch(batch)
+        max_workers = int(os.environ.get("OPENAI_CONCURRENCY", "1"))
+        batches = [to_summarize[i:i + batch_size] for i in range(0, len(to_summarize), batch_size)]
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._summarize_one_batch, batch): batch for batch in batches}
+            for future in as_completed(futures):
+                future.result()
 
         return symbols
 

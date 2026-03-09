@@ -40,6 +40,10 @@ def parse_file(content: str, filename: str, language: str) -> list[Symbol]:
         symbols = _parse_verse_symbols(source_bytes, filename)
     elif language == "lua":
         symbols = _parse_lua_symbols(source_bytes, filename)
+    elif language == "erlang":
+        symbols = _parse_erlang_symbols(source_bytes, filename)
+    elif language == "fortran":
+        symbols = _parse_fortran_symbols(source_bytes, filename)
     else:
         spec = LANGUAGE_REGISTRY[language]
         symbols = _parse_with_spec(source_bytes, filename, language, spec)
@@ -2238,31 +2242,49 @@ def _extract_nix_binding(node, source_bytes: bytes, filename: str, symbols: list
 def _parse_vue_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
     """Extract symbols from Vue Single-File Components (.vue).
 
-    Locates the <script> or <script setup> block using the tree-sitter Vue
-    grammar, determines whether it is JavaScript or TypeScript (via the
-    lang="ts" attribute), then re-parses the raw script content with the
-    appropriate JS/TS spec.  Line numbers are offset to match positions in
-    the original .vue file.
+    Handles both Composition API (<script setup>) and Options API (<script>):
+
+    Composition API:
+      - Component name from filename (kind=class)
+      - function declarations → kind=function
+      - const X = ref/reactive/computed/watch... → kind=constant
+      - const props = defineProps() / defineEmits() / defineExpose() → kind=constant
+      - Preceding // or /* */ comments as docstrings
+
+    Options API:
+      - Component name from filename (kind=class)
+      - methods: { X() } → kind=method
+      - computed: { X() } → kind=method
+      - props: [...] or props: {} → kind=constant (group)
+      - data() → kind=function
+
+    Line numbers are offset to match positions in the original .vue file.
     """
+    from pathlib import Path as _Path
     from tree_sitter_language_pack import get_parser as _get_parser
+
     vue_parser = _get_parser("vue")
     tree = vue_parser.parse(source_bytes)
 
     # Find the first <script> or <script setup> element
     script_node = None
+    is_setup = False
     for child in tree.root_node.children:
         if child.type == "script_element":
             script_node = child
+            # Detect <script setup>
+            start_tag = next((c for c in child.children if c.type == "start_tag"), None)
+            if start_tag:
+                tag_text = source_bytes[start_tag.start_byte:start_tag.end_byte].decode("utf-8", errors="replace")
+                is_setup = "setup" in tag_text
             break
 
     if script_node is None:
         return []
 
-    # Detect language from start_tag attributes (lang="ts" / lang="tsx")
+    # Detect script language (default: javascript)
     lang = "javascript"
-    start_tag = script_node.child_by_field_name("start_tag") or next(
-        (c for c in script_node.children if c.type == "start_tag"), None
-    )
+    start_tag = next((c for c in script_node.children if c.type == "start_tag"), None)
     if start_tag:
         for attr in start_tag.children:
             if attr.type == "attribute":
@@ -2274,23 +2296,278 @@ def _parse_vue_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
                     lang = "tsx"
                     break
 
-    # Extract raw_text content and its line offset within the .vue file
+    # Extract raw_text and its byte/line offset within the .vue file
     raw_node = next((c for c in script_node.children if c.type == "raw_text"), None)
     if raw_node is None:
         return []
 
-    script_content = source_bytes[raw_node.start_byte:raw_node.end_byte]
-    line_offset = raw_node.start_point[0]  # 0-based line of script content start
+    script_bytes = source_bytes[raw_node.start_byte:raw_node.end_byte]
+    line_offset = raw_node.start_point[0]  # rows are 0-based
 
-    # Parse the script block with the JS/TS spec
-    spec = LANGUAGE_REGISTRY[lang]
-    symbols = _parse_with_spec(script_content, filename, lang, spec)
+    # Component name from filename (Vue convention: filename = component name)
+    component_name = _Path(filename).stem
+    symbols: list[Symbol] = []
 
-    # Adjust line numbers to be relative to the .vue file
-    for sym in symbols:
-        sym.line = sym.line + line_offset
-        sym.end_line = sym.end_line + line_offset
-        sym.language = "vue"
+    # Synthetic component symbol (kind=class, line=1)
+    comp_sym = Symbol(
+        id=make_symbol_id(filename, component_name, "class"),
+        name=component_name,
+        qualified_name=component_name,
+        kind="class",
+        language="vue",
+        file=filename,
+        line=1,
+        end_line=source_bytes.count(b"\n") + 1,
+        signature=f"component {component_name}",
+        docstring="",
+        summary="",
+    )
+    symbols.append(comp_sym)
+
+    # Re-parse script content with the JS/TS parser
+    sub_parser = _get_parser(lang if lang != "tsx" else "typescript")
+    sub_tree = sub_parser.parse(script_bytes)
+
+    # Vue Composition API reactive primitives and macros
+    _VUE_REACTIVE = frozenset({
+        "ref", "reactive", "computed", "watch", "watchEffect",
+        "readonly", "shallowRef", "shallowReactive", "toRef", "toRefs",
+        "defineProps", "defineEmits", "defineExpose", "defineModel",
+        "useRoute", "useRouter", "useStore",
+    })
+
+    def _node_text(n) -> str:
+        return script_bytes[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
+
+    def _preceding_comment(n) -> str:
+        """Return preceding // or /* */ comment text as docstring."""
+        # Walk backwards in parent's children list
+        parent = n.parent
+        if parent is None:
+            return ""
+        prev = None
+        for c in parent.children:
+            if c.id == n.id:
+                break
+            if c.type in ("comment", "template_substitution"):
+                prev = c
+            elif c.type not in (",", "\n", " "):
+                prev = None
+        if prev and prev.type == "comment":
+            txt = _node_text(prev).strip()
+            return txt.lstrip("/").lstrip("*").strip()
+        return ""
+
+    def _adjusted_line(n) -> int:
+        return n.start_point[0] + line_offset + 1  # 1-based
+
+    def _adjusted_end_line(n) -> int:
+        return n.end_point[0] + line_offset + 1
+
+    def _is_vue_reactive_call(node) -> bool:
+        """Return True if node is a call_expression to a Vue reactive function."""
+        if node.type not in ("call_expression", "await_expression"):
+            return False
+        func = node.child_by_field_name("function") or (node.children[0] if node.children else None)
+        if func is None:
+            return False
+        name = _node_text(func).split("(")[0].split("<")[0]
+        return name in _VUE_REACTIVE
+
+    def _walk_composition(node, parent_id: Optional[str] = None):
+        """Walk script AST for Composition API symbols."""
+        if node.type == "class_declaration":
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                name = _node_text(name_node)
+                sym = Symbol(
+                    id=make_symbol_id(filename, name, "class"),
+                    name=name,
+                    qualified_name=name,
+                    kind="class",
+                    language="vue",
+                    file=filename,
+                    line=_adjusted_line(node),
+                    end_line=_adjusted_end_line(node),
+                    signature=f"class {name}",
+                    docstring=_preceding_comment(node),
+                    summary="",
+                    parent=comp_sym.id,
+                )
+                symbols.append(sym)
+            return  # don't recurse into class body
+
+        elif node.type == "function_declaration":
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                name = _node_text(name_node)
+                params = node.child_by_field_name("parameters")
+                ret = node.child_by_field_name("return_type")
+                sig = f"function {name}{_node_text(params) if params else '()'}"
+                if ret:
+                    sig += _node_text(ret)
+                sym = Symbol(
+                    id=make_symbol_id(filename, name, "function"),
+                    name=name,
+                    qualified_name=f"{component_name}.{name}",
+                    kind="function",
+                    language="vue",
+                    file=filename,
+                    line=_adjusted_line(node),
+                    end_line=_adjusted_end_line(node),
+                    signature=sig,
+                    docstring=_preceding_comment(node),
+                    summary="",
+                    parent=comp_sym.id,
+                )
+                symbols.append(sym)
+
+        elif node.type in ("interface_declaration", "type_alias_declaration", "enum_declaration"):
+            # TypeScript type-level declarations
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                name = _node_text(name_node)
+                sym = Symbol(
+                    id=make_symbol_id(filename, name, "type"),
+                    name=name,
+                    qualified_name=name,
+                    kind="type",
+                    language="vue",
+                    file=filename,
+                    line=_adjusted_line(node),
+                    end_line=_adjusted_end_line(node),
+                    signature=_node_text(node).split("{")[0].strip(),
+                    docstring=_preceding_comment(node),
+                    summary="",
+                    parent=comp_sym.id,
+                )
+                symbols.append(sym)
+            return
+
+        elif node.type in ("lexical_declaration", "variable_declaration"):
+            # const/let declarations — capture Vue reactive + macro calls
+            for decl in node.children:
+                if decl.type != "variable_declarator":
+                    continue
+                name_node = decl.child_by_field_name("name")
+                val_node = decl.child_by_field_name("value")
+                if name_node is None:
+                    continue
+                name = _node_text(name_node)
+                if not name.isidentifier():
+                    continue
+                # Only capture if RHS is a Vue reactive/macro call
+                if val_node and _is_vue_reactive_call(val_node):
+                    sig = _node_text(node).split("\n")[0].rstrip("{").strip()
+                    sym = Symbol(
+                        id=make_symbol_id(filename, name, "constant"),
+                        name=name,
+                        qualified_name=f"{component_name}.{name}",
+                        kind="constant",
+                        language="vue",
+                        file=filename,
+                        line=_adjusted_line(decl),
+                        end_line=_adjusted_end_line(decl),
+                        signature=sig,
+                        docstring=_preceding_comment(node),
+                        summary="",
+                        parent=comp_sym.id,
+                    )
+                    symbols.append(sym)
+
+        # Recurse (but not into function bodies to avoid inner helpers)
+        skip_recurse = node.type in ("function_declaration", "arrow_function", "function")
+        if not skip_recurse:
+            for child in node.children:
+                _walk_composition(child, parent_id)
+
+    def _walk_options(node):
+        """Walk script AST for Options API export default { ... }."""
+        # Find: export_statement > object (the options object)
+        if node.type == "export_statement":
+            for c in node.children:
+                if c.type in ("object", "call_expression"):
+                    _extract_options_object(c)
+            return
+        for child in node.children:
+            _walk_options(child)
+
+    def _extract_options_object(obj_node):
+        """Extract methods/computed/props/data from Options API object."""
+        for pair in obj_node.children:
+            if pair.type != "pair":
+                continue
+            key_node = pair.child_by_field_name("key")
+            val_node = pair.child_by_field_name("value")
+            if key_node is None or val_node is None:
+                continue
+            key = _node_text(key_node).strip("\"'")
+
+            if key in ("methods", "computed") and val_node.type == "object":
+                for method_pair in val_node.children:
+                    if method_pair.type in ("pair", "method_definition"):
+                        mkey = method_pair.child_by_field_name("key") or method_pair.child_by_field_name("name")
+                        if mkey:
+                            mname = _node_text(mkey).strip("\"'")
+                            sym = Symbol(
+                                id=make_symbol_id(filename, mname, "method"),
+                                name=mname,
+                                qualified_name=f"{component_name}.{mname}",
+                                kind="method",
+                                language="vue",
+                                file=filename,
+                                line=_adjusted_line(method_pair),
+                                end_line=_adjusted_end_line(method_pair),
+                                signature=f"{key}.{mname}()",
+                                docstring=_preceding_comment(method_pair),
+                                summary="",
+                                parent=comp_sym.id,
+                            )
+                            symbols.append(sym)
+
+            elif key == "props":
+                sym = Symbol(
+                    id=make_symbol_id(filename, "props", "constant"),
+                    name="props",
+                    qualified_name=f"{component_name}.props",
+                    kind="constant",
+                    language="vue",
+                    file=filename,
+                    line=_adjusted_line(pair),
+                    end_line=_adjusted_end_line(pair),
+                    signature=f"props: {_node_text(val_node)[:60]}",
+                    docstring="",
+                    summary="",
+                    parent=comp_sym.id,
+                )
+                symbols.append(sym)
+
+            elif key == "data" and val_node.type in ("function", "arrow_function"):
+                sym = Symbol(
+                    id=make_symbol_id(filename, "data", "function"),
+                    name="data",
+                    qualified_name=f"{component_name}.data",
+                    kind="function",
+                    language="vue",
+                    file=filename,
+                    line=_adjusted_line(pair),
+                    end_line=_adjusted_end_line(pair),
+                    signature="data()",
+                    docstring=_preceding_comment(pair),
+                    summary="",
+                    parent=comp_sym.id,
+                )
+                symbols.append(sym)
+
+    # Dispatch to appropriate extractor
+    if is_setup:
+        _walk_composition(sub_tree.root_node)
+    else:
+        # Options API or plain script — try options first, fallback to composition walk
+        _walk_options(sub_tree.root_node)
+        if len(symbols) == 1:  # only component sym found → try composition
+            _walk_composition(sub_tree.root_node)
+
     return symbols
 
 
@@ -2532,5 +2809,449 @@ def _parse_lua_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         ))
 
     _walk(tree.root_node)
+    symbols.sort(key=lambda s: s.line)
+    return symbols
+
+
+def _parse_erlang_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
+    """Extract symbols from Erlang source files using tree-sitter.
+
+    Erlang's grammar surfaces the following top-level forms in source_file:
+
+    - ``fun_decl``   — one node per *clause* (multi-clause functions produce
+                       multiple nodes).  Name = first ``atom`` in the first
+                       ``function_clause``.  Arity = named-child count of
+                       ``expr_args``.  Only the first clause for a given
+                       (name, arity) pair is emitted; subsequent clauses are
+                       merged by incrementing the end-line to cover the whole
+                       function body.
+    - ``type_alias`` / ``opaque`` — type definitions.  Name from
+                       ``type_name → atom``.
+    - ``record_decl``— record (struct-like) declarations.  Name from first
+                       ``atom`` named child.
+    - ``pp_define``  — macro constants.  Name from ``macro_lhs → var/atom``.
+
+    Docstrings are collected from preceding ``comment`` siblings (``%% …``).
+    """
+    from tree_sitter_language_pack import get_parser as _get_parser
+
+    parser = _get_parser("erlang")
+    tree = parser.parse(source_bytes)
+
+    symbols: list[Symbol] = []
+    # Track (name, arity) to deduplicate multi-clause fun_decls.
+    # Maps (name, arity) -> index into symbols list for end_line update.
+    seen_funs: dict[tuple[str, int], int] = {}
+
+    def _node_text(node) -> str:
+        return source_bytes[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+    def _collect_docstring(node) -> str:
+        """Collect preceding %% comment siblings as a docstring."""
+        lines: list[str] = []
+        prev = node.prev_named_sibling
+        while prev and prev.type == "comment":
+            raw = _node_text(prev).lstrip("%").strip()
+            # Strip @doc / @spec tags (EDoc convention)
+            if raw.startswith("@doc"):
+                raw = raw[4:].strip()
+            lines.insert(0, raw)
+            prev = prev.prev_named_sibling
+        return "\n".join(lines) if lines else ""
+
+    def _extract_fun_decl(node) -> None:
+        # Get the first function_clause named child
+        clause = None
+        for child in node.named_children:
+            if child.type == "function_clause":
+                clause = child
+                break
+        if clause is None:
+            return
+
+        # Name = first atom named child of clause
+        name_node = None
+        args_node = None
+        for child in clause.named_children:
+            if child.type == "atom" and name_node is None:
+                name_node = child
+            elif child.type == "expr_args" and args_node is None:
+                args_node = child
+
+        if name_node is None:
+            return
+
+        name = _node_text(name_node)
+        arity = len(args_node.named_children) if args_node else 0
+        args_text = _node_text(args_node) if args_node else "()"
+
+        key = (name, arity)
+        if key in seen_funs:
+            # Update end_line of the existing symbol to cover this clause
+            idx = seen_funs[key]
+            end_row, _ = node.end_point
+            existing = symbols[idx]
+            symbols[idx] = Symbol(
+                id=existing.id,
+                file=existing.file,
+                name=existing.name,
+                qualified_name=existing.qualified_name,
+                kind=existing.kind,
+                language=existing.language,
+                signature=existing.signature,
+                docstring=existing.docstring,
+                parent=existing.parent,
+                line=existing.line,
+                end_line=end_row + 1,
+                byte_offset=existing.byte_offset,
+                byte_length=(node.end_byte - existing.byte_offset),
+                content_hash=existing.content_hash,
+            )
+            return
+
+        signature = f"{name}{args_text}"
+        docstring = _collect_docstring(node)
+        row, _ = node.start_point
+        end_row, _ = node.end_point
+        sym_bytes = source_bytes[node.start_byte:node.end_byte]
+
+        idx = len(symbols)
+        seen_funs[key] = idx
+        symbols.append(Symbol(
+            id=make_symbol_id(filename, f"{name}/{arity}", "function"),
+            file=filename,
+            name=name,
+            qualified_name=f"{name}/{arity}",
+            kind="function",
+            language="erlang",
+            signature=signature,
+            docstring=docstring,
+            parent=None,
+            line=row + 1,
+            end_line=end_row + 1,
+            byte_offset=node.start_byte,
+            byte_length=len(sym_bytes),
+            content_hash=compute_content_hash(sym_bytes),
+        ))
+
+    def _extract_type(node) -> None:
+        """Handle type_alias and opaque nodes."""
+        type_name_node = None
+        for child in node.named_children:
+            if child.type == "type_name":
+                type_name_node = child
+                break
+        if type_name_node is None:
+            return
+
+        atom_node = None
+        for child in type_name_node.named_children:
+            if child.type == "atom":
+                atom_node = child
+                break
+        if atom_node is None:
+            return
+
+        name = _node_text(atom_node)
+        type_sig = _node_text(type_name_node)
+        docstring = _collect_docstring(node)
+        row, _ = node.start_point
+        end_row, _ = node.end_point
+        sym_bytes = source_bytes[node.start_byte:node.end_byte]
+
+        symbols.append(Symbol(
+            id=make_symbol_id(filename, name, "type"),
+            file=filename,
+            name=name,
+            qualified_name=name,
+            kind="type",
+            language="erlang",
+            signature=f"-type {type_sig}",
+            docstring=docstring,
+            parent=None,
+            line=row + 1,
+            end_line=end_row + 1,
+            byte_offset=node.start_byte,
+            byte_length=len(sym_bytes),
+            content_hash=compute_content_hash(sym_bytes),
+        ))
+
+    def _extract_record(node) -> None:
+        """Handle record_decl nodes (struct-like)."""
+        atom_node = None
+        for child in node.named_children:
+            if child.type == "atom":
+                atom_node = child
+                break
+        if atom_node is None:
+            return
+
+        name = _node_text(atom_node)
+        docstring = _collect_docstring(node)
+        row, _ = node.start_point
+        end_row, _ = node.end_point
+        sym_bytes = source_bytes[node.start_byte:node.end_byte]
+
+        symbols.append(Symbol(
+            id=make_symbol_id(filename, name, "type"),
+            file=filename,
+            name=name,
+            qualified_name=name,
+            kind="type",
+            language="erlang",
+            signature=f"-record({name}, ...)",
+            docstring=docstring,
+            parent=None,
+            line=row + 1,
+            end_line=end_row + 1,
+            byte_offset=node.start_byte,
+            byte_length=len(sym_bytes),
+            content_hash=compute_content_hash(sym_bytes),
+        ))
+
+    def _extract_define(node) -> None:
+        """Handle pp_define (macro constant) nodes."""
+        macro_lhs = None
+        for child in node.named_children:
+            if child.type == "macro_lhs":
+                macro_lhs = child
+                break
+        if macro_lhs is None:
+            return
+
+        # macro_lhs contains a var or atom for the macro name
+        name_node = None
+        for child in macro_lhs.named_children:
+            if child.type in ("var", "atom"):
+                name_node = child
+                break
+        if name_node is None:
+            return
+
+        name = _node_text(name_node)
+        full_text = _node_text(node)
+        # Trim trailing '.' for a cleaner signature
+        signature = full_text.rstrip(".")
+        docstring = _collect_docstring(node)
+        row, _ = node.start_point
+        end_row, _ = node.end_point
+        sym_bytes = source_bytes[node.start_byte:node.end_byte]
+
+        symbols.append(Symbol(
+            id=make_symbol_id(filename, name, "constant"),
+            file=filename,
+            name=name,
+            qualified_name=name,
+            kind="constant",
+            language="erlang",
+            signature=signature,
+            docstring=docstring,
+            parent=None,
+            line=row + 1,
+            end_line=end_row + 1,
+            byte_offset=node.start_byte,
+            byte_length=len(sym_bytes),
+            content_hash=compute_content_hash(sym_bytes),
+        ))
+
+    for node in tree.root_node.named_children:
+        if node.type == "fun_decl":
+            _extract_fun_decl(node)
+        elif node.type in ("type_alias", "opaque"):
+            _extract_type(node)
+        elif node.type == "record_decl":
+            _extract_record(node)
+        elif node.type == "pp_define":
+            _extract_define(node)
+
+    symbols.sort(key=lambda s: s.line)
+    return symbols
+
+
+def _parse_fortran_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
+    """Extract symbols from Fortran source files using tree-sitter.
+
+    Handles free-form and fixed-form Fortran (F77–F2018).  The grammar's
+    ``translation_unit`` root contains:
+
+    - ``function`` / ``subroutine`` — top-level procedures.  Name from the
+      inner ``function_statement`` / ``subroutine_statement`` → ``name`` field.
+    - ``module`` — namespace/container.  Extracted as kind ``"class"``.
+      Procedures inside ``internal_procedures`` are extracted as kind
+      ``"method"`` with the module name as parent.  ``derived_type_definition``
+      nodes inside the module become ``"type"`` symbols.  ``variable_declaration``
+      nodes with a ``parameter`` qualifier become ``"constant"`` symbols.
+    - ``program`` — top-level program block.  Extracted as kind ``"class"``
+      so it appears in outlines; its ``contains`` procedures are extracted
+      as ``"method"`` symbols.
+
+    Preceding ``!`` comments are collected as docstrings.
+    """
+    from tree_sitter_language_pack import get_parser as _get_parser
+
+    parser = _get_parser("fortran")
+    tree = parser.parse(source_bytes)
+
+    symbols: list[Symbol] = []
+
+    def _node_text(node) -> str:
+        return source_bytes[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+    def _collect_docstring(node) -> str:
+        """Collect preceding ! comment siblings as a docstring."""
+        lines: list[str] = []
+        prev = node.prev_named_sibling
+        while prev and prev.type == "comment":
+            raw = _node_text(prev).lstrip("!").strip()
+            lines.insert(0, raw)
+            prev = prev.prev_named_sibling
+        return "\n".join(lines) if lines else ""
+
+    def _make_sym(
+        node,
+        name: str,
+        qualified_name: str,
+        kind: str,
+        signature: str,
+        docstring: str,
+        parent: Optional[str],
+    ) -> None:
+        row, _ = node.start_point
+        end_row, _ = node.end_point
+        sym_bytes = source_bytes[node.start_byte:node.end_byte]
+        symbols.append(Symbol(
+            id=make_symbol_id(filename, qualified_name, kind),
+            file=filename,
+            name=name,
+            qualified_name=qualified_name,
+            kind=kind,
+            language="fortran",
+            signature=signature,
+            docstring=docstring,
+            parent=parent,
+            line=row + 1,
+            end_line=end_row + 1,
+            byte_offset=node.start_byte,
+            byte_length=len(sym_bytes),
+            content_hash=compute_content_hash(sym_bytes),
+        ))
+
+    def _extract_procedure(node, parent_name: Optional[str] = None) -> None:
+        """Extract a function or subroutine node."""
+        stmt_type = "function_statement" if node.type == "function" else "subroutine_statement"
+        stmt = next((c for c in node.named_children if c.type == stmt_type), None)
+        if stmt is None:
+            return
+
+        name_node = stmt.child_by_field_name("name")
+        params_node = stmt.child_by_field_name("parameters")
+        if name_node is None:
+            return
+
+        name = _node_text(name_node)
+        params = _node_text(params_node) if params_node else "()"
+        kind = "method" if parent_name else "function"
+        qualified_name = f"{parent_name}::{name}" if parent_name else name
+        keyword = "function" if node.type == "function" else "subroutine"
+        signature = f"{keyword} {name}{params}"
+        docstring = _collect_docstring(node)
+
+        _make_sym(node, name, qualified_name, kind, signature, docstring, parent_name)
+
+    def _extract_derived_type(node, parent_name: Optional[str] = None) -> None:
+        """Extract a derived_type_definition node."""
+        stmt = next((c for c in node.named_children if c.type == "derived_type_statement"), None)
+        if stmt is None:
+            return
+
+        # Name is in a type_name child of the statement
+        type_name_node = next(
+            (c for c in stmt.named_children if c.type == "type_name"),
+            None,
+        )
+        if type_name_node is None:
+            return
+
+        name = _node_text(type_name_node).strip()
+        qualified_name = f"{parent_name}::{name}" if parent_name else name
+        signature = f"type :: {name}"
+        docstring = _collect_docstring(node)
+
+        _make_sym(node, name, qualified_name, "type", signature, docstring, parent_name)
+
+    def _is_parameter_decl(node) -> bool:
+        """Return True if a variable_declaration has a 'parameter' qualifier."""
+        return any(
+            c.type == "type_qualifier" and _node_text(c).strip().lower() == "parameter"
+            for c in node.named_children
+        )
+
+    def _extract_parameter_constants(node, parent_name: Optional[str] = None) -> None:
+        """Extract named constants from a variable_declaration with parameter qualifier."""
+        for child in node.named_children:
+            if child.type == "init_declarator":
+                id_node = child.child_by_field_name("name")
+                if id_node is None:
+                    # Fallback: first identifier named child
+                    id_node = next(
+                        (c for c in child.named_children if c.type == "identifier"),
+                        None,
+                    )
+                if id_node is None:
+                    continue
+                name = _node_text(id_node).strip()
+                qualified_name = f"{parent_name}::{name}" if parent_name else name
+                signature = _node_text(node).strip()
+                docstring = _collect_docstring(node)
+                _make_sym(node, name, qualified_name, "constant", signature, docstring, parent_name)
+
+    def _walk_scope(nodes, parent_name: Optional[str] = None) -> None:
+        """Walk a sequence of nodes extracting symbols with an optional parent."""
+        for node in nodes:
+            if node.type in ("function", "subroutine"):
+                _extract_procedure(node, parent_name)
+            elif node.type == "derived_type_definition":
+                _extract_derived_type(node, parent_name)
+            elif node.type == "variable_declaration" and _is_parameter_decl(node):
+                _extract_parameter_constants(node, parent_name)
+            elif node.type == "internal_procedures":
+                _walk_scope(node.named_children, parent_name)
+
+    def _extract_module_or_program(node) -> None:
+        """Extract a module or program block as a class-like container."""
+        stmt_type = "module_statement" if node.type == "module" else "program_statement"
+        stmt = next((c for c in node.named_children if c.type == stmt_type), None)
+        if stmt is None:
+            # Still recurse to catch nested procedures
+            _walk_scope(node.named_children)
+            return
+
+        name_node = stmt.child_by_field_name("name") or next(
+            (c for c in stmt.named_children if c.type == "name"), None
+        )
+        if name_node is None:
+            _walk_scope(node.named_children)
+            return
+
+        name = _node_text(name_node).strip()
+        keyword = "module" if node.type == "module" else "program"
+        signature = f"{keyword} {name}"
+        docstring = _collect_docstring(node)
+        _make_sym(node, name, name, "class", signature, docstring, None)
+
+        # Recurse into the module/program body with this name as parent
+        _walk_scope(node.named_children, parent_name=name)
+
+    # Walk translation_unit top-level children
+    for node in tree.root_node.named_children:
+        if node.type in ("function", "subroutine"):
+            _extract_procedure(node, parent_name=None)
+        elif node.type in ("module", "program"):
+            _extract_module_or_program(node)
+        elif node.type == "derived_type_definition":
+            _extract_derived_type(node)
+        elif node.type == "variable_declaration" and _is_parameter_decl(node):
+            _extract_parameter_constants(node)
+
     symbols.sort(key=lambda s: s.line)
     return symbols

@@ -2,12 +2,15 @@
 
 import asyncio
 import hashlib
+import logging
 import os
 from collections import defaultdict
 from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from ..parser import parse_file, LANGUAGE_EXTENSIONS, get_language_for_path
 from ..security import is_secret_file, is_binary_extension, get_max_index_files, SKIP_PATTERNS
@@ -254,11 +257,13 @@ async def index_repo(
         owner, repo = parse_github_url(url)
     except ValueError as e:
         return {"success": False, "error": str(e)}
-    
+
+    logger.info("index_repo start — repo: %s/%s, incremental: %s", owner, repo, incremental)
+
     # Get GitHub token from env if not provided
     if not github_token:
         github_token = os.environ.get("GITHUB_TOKEN")
-    
+
     warnings = []
     max_files = get_max_index_files()
     
@@ -283,9 +288,11 @@ async def index_repo(
             max_files=max_files,
         )
         
+        logger.info("index_repo discovery — %d source files (truncated=%s)", len(source_files), truncated)
+
         if not source_files:
             return {"success": False, "error": "No source files found"}
-        
+
         # Fetch all file contents concurrently
         semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
 
@@ -310,10 +317,28 @@ async def index_repo(
 
         # Incremental path
         existing_index = store.load_index(owner, repo)
+
+        if existing_index is None and store.has_index(owner, repo):
+            logger.warning(
+                "index_repo version_mismatch — %s/%s: on-disk index is a newer version; full re-index required",
+                owner, repo,
+            )
+            warnings.append(
+                "Existing index was created by a newer version of jcodemunch-mcp "
+                "and cannot be read — performing a full re-index. "
+                "If you downgraded the package, delete ~/.code-index/ (or your "
+                "CODE_INDEX_PATH directory) to remove the stale index."
+            )
+
         if incremental and existing_index is not None:
             changed, new, deleted = store.detect_changes(owner, repo, current_files)
+            logger.info(
+                "index_repo incremental — changed: %d, new: %d, deleted: %d",
+                len(changed), len(new), len(deleted),
+            )
 
             if not changed and not new and not deleted:
+                logger.info("index_repo incremental — no changes detected, skipping save")
                 return {
                     "success": True,
                     "message": "No changes detected",
@@ -376,6 +401,7 @@ async def index_repo(
             return result
 
         # Full index path
+        logger.info("index_repo full — parsing %d files", len(current_files))
         all_symbols = []
         symbols_by_file: dict[str, list] = defaultdict(list)
         source_file_list = sorted(current_files)
@@ -396,6 +422,11 @@ async def index_repo(
             except Exception:
                 warnings.append(f"Failed to parse {path}")
                 continue
+
+        logger.info(
+            "index_repo parsing complete — with symbols: %d, no symbols: %d",
+            len(symbols_by_file), len(no_symbols_files),
+        )
 
         # Generate summaries
         if all_symbols:
@@ -443,6 +474,11 @@ async def index_repo(
             "no_symbols_files": no_symbols_files[:50],
         }
 
+        logger.info(
+            "index_repo complete — repo: %s/%s, files: %d, symbols: %d",
+            owner, repo, len(source_file_list), len(all_symbols),
+        )
+
         if warnings:
             result["warnings"] = warnings
 
@@ -450,6 +486,7 @@ async def index_repo(
             result["warnings"] = warnings + [f"Repository has many files; indexed first {max_files}"]
 
         return result
-    
+
     except Exception as e:
+        logger.error("index_repo failed — %s/%s: %s", owner, repo, e, exc_info=True)
         return {"success": False, "error": f"Indexing failed: {str(e)}"}
